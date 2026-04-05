@@ -6,70 +6,76 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 # Development
-npm run dev          # Start dev server with Turbopack at localhost:3000
-npm run build        # Production build
-npm run lint         # ESLint via Next.js
+npm run dev           # Start dev server with Turbopack (requires node-compat.cjs)
+npm run dev:daemon    # Start dev server in background, logs to logs.txt
+
+# Build & Lint
+npm run build
+npm run lint          # next lint
 
 # Testing
-npm run test         # Run all Vitest tests
-npx vitest run src/path/to/file.test.ts  # Run a single test file
+npm run test                          # Run all tests
+npm run test -- src/path/to/file.test.tsx  # Run a single test file
 
 # Database
-npm run setup        # Install deps + generate Prisma client + run migrations
-npm run db:reset     # Reset database (destructive)
-npx prisma studio    # Open Prisma GUI
-
-# Background dev server
-npm run dev:daemon   # Start server in background, logs to logs.txt
+npm run setup         # Install deps + generate Prisma client + run migrations
+npm run db:reset      # Reset database (destructive)
 ```
 
-All dev/build commands require the `NODE_OPTIONS='--require ./node-compat.cjs'` prefix (already baked into npm scripts) for Node.js compatibility.
+## Environment Variables
 
-## Environment
-
-Add an `ANTHROPIC_API_KEY` to `.env` to use real Claude AI. Without it, the app falls back to a mock provider (see `src/lib/provider.ts`).
+- `ANTHROPIC_API_KEY` — required for real Claude API calls (omit to use mock provider)
+- `JWT_SECRET` — defaults to `"development-secret-key"` if unset
 
 ## Architecture
 
-UIGen is an AI-powered React component generator. Users describe UI in a chat, Claude generates code, and the result is rendered live in an iframe.
+UIGen is a Next.js 15 (App Router) application that lets users describe React components in natural language and generates them via Claude AI with a live preview.
 
-### Data Flow
+### Core Data Flow
 
-1. User sends message → `POST /api/chat` (streaming)
-2. Claude responds using two tools: `str_replace_editor` (create/edit files) and `file_manager` (rename/delete)
-3. Tool calls update the `VirtualFileSystem` (in-memory, no disk writes)
-4. Preview iframe re-renders by transpiling files via `@babel/standalone` at runtime
-5. Project state (chat history + file system) serializes to JSON and persists in SQLite via Prisma
+```
+User message → ChatContext → POST /api/chat
+  → Claude (streamText) → tool calls (str_replace_editor, file_manager)
+  → FileSystemContext updates → PreviewFrame re-renders iframe
+```
 
-### Key Abstractions
+The chat API route (`src/app/api/chat/route.ts`) drives all component generation. It streams responses from Claude using the Vercel AI SDK and exposes two tools to the model:
+- **`str_replace_editor`** (`src/lib/tools/str-replace.ts`) — patch existing file contents
+- **`file_manager`** (`src/lib/tools/file-manager.ts`) — create/delete/rename files
 
-**`VirtualFileSystem`** (`src/lib/file-system.ts`) — In-memory file tree that serializes to JSON for database storage. All file operations go through this class.
+### Virtual File System
 
-**`FileSystemContext`** (`src/lib/contexts/file-system-context.tsx`) — React context wrapping `VirtualFileSystem`, exposes file CRUD operations and syncs state to the database.
+There is no disk I/O for generated files. `VirtualFileSystem` (`src/lib/file-system.ts`) holds all files in memory. `FileSystemContext` (`src/lib/contexts/file-system-context.tsx`) exposes this to the component tree.
 
-**`ChatContext`** (`src/lib/contexts/chat-context.tsx`) — Manages conversation history and streams AI responses from `/api/chat`. Handles tool call results and updates the file system.
+### Preview Rendering
 
-**`provider.ts`** (`src/lib/provider.ts`) — Abstracts AI model selection. Returns real Anthropic Claude (`claude-haiku-4-5`) when `ANTHROPIC_API_KEY` is set, mock otherwise.
+`PreviewFrame` (`src/components/preview/PreviewFrame.tsx`) renders an iframe. `jsx-transformer.ts` (`src/lib/transform/jsx-transformer.ts`) transforms virtual JSX files to runnable HTML using `@babel/standalone` before injecting them into the iframe.
 
-**`PreviewFrame`** (`src/components/preview/PreviewFrame.tsx`) — Renders the virtual file system in a sandboxed iframe. Uses `@babel/standalone` to transpile JSX at runtime, resolving imports across virtual files.
+### Authentication & Persistence
 
-### AI Tools (called by Claude during generation)
+Auth uses JWT sessions (`src/lib/auth.ts`) + bcrypt. Middleware (`src/middleware.ts`) guards `/[projectId]` routes. When a user is authenticated, the chat API saves the full chat history and virtual file system state as JSON into the `Project` table (SQLite via Prisma).
 
-- **`str_replace_editor`** (`src/lib/tools/str-replace.ts`) — Creates new files or applies string-replacement edits to existing ones
-- **`file_manager`** (`src/lib/tools/file-manager.ts`) — Renames or deletes files in the virtual FS
+### State Management
 
-### Authentication
+Two React contexts handle all app state:
+- **`FileSystemContext`** — virtual FS, selected file, file CRUD operations
+- **`ChatContext`** — messages, streaming state, calls to `/api/chat`
 
-JWT-based auth using JOSE + HTTP-only cookies. Anonymous users can create projects (tracked in `localStorage` via `anon-work-tracker.ts`). `src/middleware.ts` protects routes and handles anonymous → registered user migration.
+### Layout
 
-### Database Schema
+`MainContent` (`src/app/main-content.tsx`) is a two-panel resizable layout (react-resizable-panels): chat on the left (~35%), tabs with Preview/Code on the right (~65%).
 
-Two models in SQLite (`prisma/dev.db`):
-- `User` — email/password accounts
-- `Project` — stores `messages` (chat history as JSON string) and `data` (virtual FS as JSON string); `userId` is nullable to support anonymous projects
+### AI Provider
 
-Prisma client is generated to `src/generated/prisma`.
+`src/lib/provider.ts` returns either the real Anthropic model or a mock, depending on whether `ANTHROPIC_API_KEY` is set. The system prompt lives in `src/lib/prompts/generation.tsx`.
 
-### UI Structure
+## Tech Stack
 
-Resizable two-panel layout: chat on the left, tabbed preview/code editor on the right. shadcn/ui components (new-york style, neutral base) with Lucide icons. Path alias `@/*` maps to `src/*`.
+- **Framework:** Next.js 15, React 19, TypeScript 5
+- **Styling:** Tailwind CSS v4, Radix UI primitives
+- **Editor:** Monaco Editor (`@monaco-editor/react`)
+- **AI:** Vercel AI SDK + `@ai-sdk/anthropic`
+- **Database:** SQLite via Prisma
+- **JSX transform:** `@babel/standalone` (client-side, in-browser)
+- **Testing:** Vitest + React Testing Library + jsdom
+- **Path alias:** `@/*` → `src/*`
