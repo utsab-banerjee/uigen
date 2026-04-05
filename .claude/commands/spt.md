@@ -1,0 +1,1 @@
+Run an internet shpped test, then display the upload and download speed
